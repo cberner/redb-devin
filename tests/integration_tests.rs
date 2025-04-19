@@ -1922,3 +1922,65 @@ fn custom_table_type() {
         table.get(1).unwrap().next().unwrap().unwrap().value()
     );
 }
+
+#[test]
+fn crash_bug() {
+    use redb::backends::InMemoryBackend;
+    use redb::{Database, TableDefinition};
+    use std::sync::Arc;
+    use std::thread::{self, sleep};
+    use std::time::Duration;
+
+    const TABLE: TableDefinition<'static, u32, &[u8]> = TableDefinition::new("TABLE");
+
+    fn write(db: &Database, key: u32, val: &[u8]) -> Result<(), redb::Error> {
+        let tx = db.begin_write()?;
+
+        {
+            let mut table = tx.open_table(TABLE)?;
+            table.insert(key, val)?;
+        }
+        tx.commit()?;
+
+        Ok(())
+    }
+
+    fn read(db: &Database, key: u32) -> Result<Option<Vec<u8>>, redb::Error> {
+        let tx = db.begin_read()?;
+        let table = tx.open_table(TABLE)?;
+        Ok(table.get(key)?.map(|guard| guard.value().to_owned()))
+    }
+
+    let db = Arc::new(
+        Database::builder()
+            .create_with_backend(InMemoryBackend::new())
+            .unwrap(),
+    );
+
+    write(&db, 1, &[]).unwrap();
+
+    for _ in 0..30 {
+        thread::spawn({
+            let db = db.clone();
+
+            move || loop {
+                match read(&db, 1) {
+                    Ok(_) => {}
+                    Err(redb::Error::LockPoisoned(_)) => {
+                        println!("Lock poisoned");
+                    }
+                    Err(e) => panic!("{:?}", e),
+                }
+                // This is needed
+                sleep(Duration::from_millis(1));
+            }
+        });
+    }
+
+    let mut val = [0u8; 1024];
+
+    for _ in 0..5_000_000 {
+        rand::fill(&mut val);
+        write(&db, 1, &val).unwrap();
+    }
+}
